@@ -16,71 +16,76 @@ import torch.nn as nn
 from model.utils import PositionalEncoding
 
 class TransformerRF(nn.Module):
-    def __init__(self, token_dim=128, num_layers=3, nhead=4):
+    def __init__(self, token_dim=128, num_layers=2, nhead=4, num_freqs=6):
         super().__init__()
+        self.token_dim = token_dim
         
-        # Transformer Encoder
-        # Allows tokens to share global context BEFORE rendering
+        # Transformer to refine tokens
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=token_dim, 
-            nhead=nhead, 
+            nhead=nhead,
             dim_feedforward=256,
-            dropout=0.1,
-            batch_first=True,
-            norm_first=True # Critical for training stability!
+            batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Attention Pooling
-        # Instead of MaxPool, we let the Ray "attend" to the most relevant tokens
-        # A simplified dot-product attention
-        self.attention_query = nn.Linear(39, token_dim) # Maps encoded ray dir to token space
-        
-        # Decoder
-        self.decoder_mlp = nn.Sequential(
-            nn.Linear(token_dim + 39, 128),
+        # Ray encoder: maps (rays_o, rays_d) -> query vector
+        # Using positional encoding for better spatial reasoning
+        self.pos_enc = PositionalEncoding(num_freqs=num_freqs) 
+        # PositionalEncoding returns the original input concatenated with encoded features,
+        #  so it's 3 + 36 = 39 dimensions per ray for 6 number of frequencies.
+        # With both rays_o and rays_d, you get 39 * 2 = 78 total dimensions.
+        input_dim = (3 + num_freqs * 2 * 3) * 2  # 6 frequencies, 2 (sin+cos), 3 coords, 2 (o and d)
+        self.ray_encoder = nn.Sequential(
+            nn.Linear(input_dim, 128),  # 72 from pos encoding + 6 original inputs
             nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 3), 
-            nn.Sigmoid()
+            nn.Linear(128, token_dim)
         )
         
-        # Positional Encoding helper (from previous response)
-        self.pos_enc = PositionalEncoding(num_freqs=6)
+        # Final MLP to predict RGB
+        self.rgb_head = nn.Sequential(
+            nn.Linear(token_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3),
+            nn.Sigmoid()
+        )
 
-    def forward(self, tokens, w_out):
+    def forward(self, object_code, rays_o, rays_d):
         """
-        tokens: [Batch, N, Dim] (e.g., 500 triangle tokens OR 16 object slots)
-        w_out:  [Batch, 3]      (Ray Directions)
+        object_code: [Batch, Dim] or [Batch, N_tokens, Dim]
+        rays_o: [Batch, 3] - ray origins
+        rays_d: [Batch, 3] - ray directions
+        Returns: [Batch, 3] - predicted RGB
         """
-        batch_size = tokens.shape[0]
+        # Ensure tokens have sequence dimension
+        if object_code.dim() == 2:
+            tokens = object_code.unsqueeze(1)  # [Batch, 1, Dim]
+        else:
+            tokens = object_code  # [Batch, N, Dim]
         
-        # --- Stage 1: Reasoning (Transformer) ---
-        # The tokens interact. Triangle A talks to Triangle B.
-        # Shape: [Batch, N, Dim]
-        refined_tokens = self.transformer(tokens)
+        # Refine tokens with transformer
+        refined_tokens = self.transformer(tokens)  # [Batch, N, Dim]
         
-        # --- Stage 2: Ray-Token Integration ---
-        # Which tokens matter for THIS specific ray?
+        # Encode ray with positional encoding
+        ray_emb = torch.cat([
+            self.pos_enc(rays_o),
+            self.pos_enc(rays_d)
+        ], dim=-1)  # [Batch, 72]
         
-        # Encode ray direction: [Batch, 39]
-        ray_emb = self.pos_enc(w_out) 
+        # Generate query from ray
+        query = self.ray_encoder(ray_emb)  # [Batch, Dim]
+        query = query.unsqueeze(1)  # [Batch, 1, Dim]
         
-        # Project ray to query: [Batch, 1, Dim]
-        query = self.attention_query(ray_emb).unsqueeze(1)
-        
-        # Calculate Attention Scores: (Query . Key)
-        # [Batch, 1, Dim] x [Batch, Dim, N] -> [Batch, 1, N]
+        # Attention: query attends to refined tokens
         attn_scores = torch.bmm(query, refined_tokens.transpose(1, 2))
-        attn_weights = torch.softmax(attn_scores / (128**0.5), dim=-1)
+        attn_weights = torch.softmax(attn_scores / (self.token_dim**0.5), dim=-1)
         
-        # Weighted Sum of tokens: [Batch, 1, Dim]
-        context_vector = torch.bmm(attn_weights, refined_tokens).squeeze(1)
+        # Weighted sum of tokens
+        attended = torch.bmm(attn_weights, refined_tokens).squeeze(1)  # [Batch, Dim]
         
-        # --- Stage 3: Decoding ---
-        # Concat Context + Ray Direction
-        decoder_input = torch.cat([context_vector, ray_emb], dim=-1)
-        rgb = self.decoder_mlp(decoder_input)
+        # Predict RGB
+        rgb = self.rgb_head(attended)  # [Batch, 3]
         
         return rgb

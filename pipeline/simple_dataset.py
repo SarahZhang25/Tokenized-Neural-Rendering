@@ -17,43 +17,42 @@ class SingleObjectDataset(Dataset):
         
         # 1. Load Data
         data = np.load(npz_path)
+                
+        # Load and normalize RGB to [0, 1]
+        rgb = data['rgb'].astype(np.float32) / 255.0  # CRITICAL FIX
+        rays_o = data['rays_o'].astype(np.float32)
+        rays_d = data['rays_d'].astype(np.float32)
         
-        # Raw Shapes: [N_images, H, W, 3]
-        _rgb = data['rgb'] 
-        _rays_o = data['rays_o']
-        _rays_d = data['rays_d']
+        # Reshape from (20, 128, 128, 3) to (20*128*128, 3)
+        n_views, H, W, _ = rgb.shape
+        self.rgb_pixels = torch.from_numpy(rgb.reshape(-1, 3)).to(device)
+        self.rays_o = torch.from_numpy(rays_o.reshape(-1, 3)).to(device)
+        self.rays_d = torch.from_numpy(rays_d.reshape(-1, 3)).to(device)
         
-        # 2. Preprocess: Normalize and Flatten
-        # We flatten all pixels from all images into one long list of rays.
-        # This lets us shuffle pixels globally (better for training stability).
+        # Compute per-pixel weights (higher weight for non-black pixels)
+        is_foreground = (self.rgb_pixels.sum(dim=1) > 0.01).float()
+        n_fg = is_foreground.sum()
+        n_bg = len(is_foreground) - n_fg
         
-        # RGB: Normalize 0-255 -> 0.0-1.0
-        # Shape: [N_total_pixels, 3]
-        self.rgb = torch.from_numpy(_rgb.reshape(-1, 3)).float() / 255.0
+        # Balance weights so foreground and background contribute equally
+        self.weights = torch.ones_like(is_foreground)
+        if n_fg > 0 and n_bg > 0:
+            self.weights[is_foreground == 1] = n_bg / n_fg  # Upweight foreground
+            # Background keeps weight 1.0
         
-        # Rays: Shape [N_total_pixels, 3]
-        self.rays_o = torch.from_numpy(_rays_o.reshape(-1, 3)).float()
-        self.rays_d = torch.from_numpy(_rays_d.reshape(-1, 3)).float()
-        
-        # Optional: Move entire dataset to GPU (If it fits in VRAM)
-        # 50 images * 128*128 * 3 floats is tiny (~30MB), so this is safe.
-        if device == 'cuda' and torch.cuda.is_available():
-            self.rgb = self.rgb.to(device)
-            self.rays_o = self.rays_o.to(device)
-            self.rays_d = self.rays_d.to(device)
-            print(f"Loaded {len(self.rgb)} rays to GPU memory.")
-        else:
-            print(f"Loaded {len(self.rgb)} rays to CPU memory.")
+        print(f"Dataset loaded: {len(self)} rays")
+        print(f"RGB range: [{self.rgb_pixels.min():.3f}, {self.rgb_pixels.max():.3f}]")
+        print(f"RGB mean: {self.rgb_pixels.mean():.3f}")
+        print(f"Foreground pixels: {n_fg.item()} ({100*n_fg/len(self):.1f}%)")
+        print(f"Foreground weight: {self.weights[is_foreground == 1][0].item():.2f}x")
 
     def __len__(self):
-        return self.rgb.shape[0]
+        return len(self.rgb_pixels)
 
     def __getitem__(self, idx):
-        """
-        Returns a single ray-pixel pair.
-        """
         return {
-            'rays_o': self.rays_o[idx],  # [3]
-            'rays_d': self.rays_d[idx],  # [3] - This is your w_out (inverted)
-            'rgb':    self.rgb[idx]      # [3] - Ground Truth Color
+            'rays_o': self.rays_o[idx],
+            'rays_d': self.rays_d[idx],
+            'rgb': self.rgb_pixels[idx],
+            'weight': self.weights[idx]
         }
