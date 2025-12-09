@@ -1,6 +1,11 @@
 """
 Usage: 
-python ./pipeline/simple_data_generation.py <num_views>
+python ./pipeline/simple_data_generation.py <num_views=10> <split=train> <save_dir=train_views> <save_imgs=True>
+
+e.g. 
+python ./pipeline/simple_data_generation.py 100 train train_views True
+python ./pipeline/simple_data_generation.py 20 train train_views True
+python ./pipeline/simple_data_generation.py 20 val val_views True
 """
 
 import os
@@ -135,12 +140,14 @@ def load_and_fix_mesh(path, target_scale=None):
 
 def create_dataset(
         num_views: int = 10, 
+        split: str = 'train', # 'train' or 'test'
         save_imgs: bool = True, 
         save_dir: str = 'train_views'
     ):
     """Main generation loop."""
-    if save_imgs and not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+    output_dir = f'./{save_dir}_{split}_{num_views}'
+    if save_imgs and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     
     # FIXED: Brighter ambient light
     scene = pyrender.Scene(bg_color=[0, 0, 0, 0])
@@ -180,6 +187,22 @@ def create_dataset(
     
     print(f"Bunny positioned at: {bunny_position}")
     
+    # --- NEW: Sample Points from Surface ---
+    # Sample 1024 points to represent the geometry tokens
+    print("Sampling surface points for tokens...")
+    
+    # Fix seed so Train and Val get the SAME geometry sampling
+    # This ensures the "Object Representation" is identical across splits
+    np.random.seed(42) 
+    points, _ = trimesh.sample.sample_surface(bunny_trimesh, 1024)
+    
+    # Reset seed to None so that camera poses (generated later) are still random!
+    np.random.seed(None)
+    
+    # Apply the same transformation as the mesh (bunny_position)
+    # The mesh was added with pose_bunny, which has translation in [:3, 3]
+    points = points + bunny_position
+
     # --- 3. FIXED: Reduce light intensity to avoid oversaturation ---
     # Main ceiling light above bunny
     light1 = pyrender.PointLight(color=[1.0, 1.0, 1.0], intensity=50.0)  # Reduced from 200
@@ -206,7 +229,7 @@ def create_dataset(
     
     all_rgb, all_rays_o, all_rays_d = [], [], []
     
-    print(f"Generating data... Saving images to ./{save_dir}/")
+    print(f"Generating data... Saving images to {output_dir}")
     renderer = pyrender.OffscreenRenderer(W, H)
     
     for i in range(num_views):
@@ -214,10 +237,10 @@ def create_dataset(
         # Box extends roughly from -2 to +2 in each dimension
         radius = np.random.uniform(1.2, 1.8)  # Stay inside box (radius < 2)
         azimuth = np.random.uniform(0, 2*np.pi)
-        # Elevation: look from slightly below to above bunny
+        # Elevation: look from slightly below to above bunsny
         elevation = np.random.uniform(-0.2, 0.5)
         
-        # CRITICAL FIX: Camera looks at bunny, not origin
+        # Camera looks at bunny
         pose = get_camera_pose(
             radius=radius, 
             azimuth=azimuth, 
@@ -233,7 +256,7 @@ def create_dataset(
         
         # Save Image
         img = Image.fromarray(color)
-        img.save(os.path.join(save_dir, f'view_{i:03d}.png'))
+        img.save(os.path.join(output_dir, f'view_{i:03d}.png'))
         
         # Collect Data
         rays_o, rays_d = generate_rays(H, W, K, pose)
@@ -247,12 +270,16 @@ def create_dataset(
     renderer.delete()
     
     # Save Arrays
-    np.savez('experiment_data.npz', 
+    np.savez(f'experiment_data_{split}_{num_views}.npz', 
              rgb=np.stack(all_rgb), 
              rays_o=np.stack(all_rays_o), 
-             rays_d=np.stack(all_rays_d))
-    print("Done! Data saved to experiment_data.npz")
+             rays_d=np.stack(all_rays_d),
+             object_points=points.astype(np.float32))
+    print(f"Done! Data saved to experiment_data_{split}_{num_views}.npz")
 
 if __name__ == "__main__":
     num_views = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-    create_dataset(num_views=num_views)
+    split = sys.argv[2] if len(sys.argv) > 2 else 'train'
+    save_dir = sys.argv[3] if len(sys.argv) > 3 else 'train_views'
+    save_imgs = bool(sys.argv[4]) if len(sys.argv) > 4 else True
+    create_dataset(num_views=num_views, split=split, save_imgs=save_imgs, save_dir=save_dir)

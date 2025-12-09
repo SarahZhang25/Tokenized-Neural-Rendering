@@ -28,6 +28,7 @@ class SingleObjectDataset(Dataset):
         self.rgb_pixels = torch.from_numpy(rgb.reshape(-1, 3)).to(device)
         self.rays_o = torch.from_numpy(rays_o.reshape(-1, 3)).to(device)
         self.rays_d = torch.from_numpy(rays_d.reshape(-1, 3)).to(device)
+        self.points = torch.from_numpy(data['object_points']).to(device)
         
         # Compute per-pixel weights (higher weight for non-black pixels)
         is_foreground = (self.rgb_pixels.sum(dim=1) > 0.01).float()
@@ -56,3 +57,7 @@ class SingleObjectDataset(Dataset):
             'rgb': self.rgb_pixels[idx],
             'weight': self.weights[idx]
         }
+
+    def get_points(self):
+        return self.points
+    
